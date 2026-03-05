@@ -1,140 +1,86 @@
-# src/app/routes.py
 from __future__ import annotations
 
 import io
-import uuid
+import os
 import zipfile
-import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
 
-from flask import Blueprint, current_app, jsonify, redirect, request, Response
-from azure.cosmos import exceptions as cos_ex
+from flask import Blueprint, current_app, jsonify, request, send_file
 
-from .settings import Settings
+from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobSasPermissions, generate_blob_sas
 
-from azure.storage.blob import (
-    BlobServiceClient,
-    BlobSasPermissions,
-    generate_blob_sas,
-)
-from urllib.parse import urlsplit, urlunsplit
+from app.auth import require_login  # <-- IMPORTANT: use the same auth/cookie logic as auth.py
 
 bp = Blueprint("api", __name__)
 
-# -------- helpers --------
-def container():
-    return current_app.config["COSMOS_CONTAINER"]
+# ----------------------------
+# Helpers: pull shared clients/settings from app config (do NOT create at import time)
+# ----------------------------
 
-def settings() -> Settings:
+def _settings():
+    # set in __init__.py: app.config["APP_SETTINGS"] = Settings.from_env()
     return current_app.config["APP_SETTINGS"]
 
-def _blob_service(s: Settings) -> BlobServiceClient:
-    return BlobServiceClient(
-        f"https://{s.BLOB_ACCOUNT}.blob.core.windows.net",
-        credential=s.BLOB_KEY,
-    )
+def _cosmos_container():
+    # set in __init__.py: app.config["COSMOS_CONTAINER"] = coll
+    return current_app.config["COSMOS_CONTAINER"]
 
-def _public_blob_url(s: Settings, blob_path: str) -> str:
+def _blob_container_client():
+    s = _settings()
+    account_url = f"https://{s.BLOB_ACCOUNT}.blob.core.windows.net"
+    svc = BlobServiceClient(account_url=account_url, credential=s.BLOB_KEY)
+    return svc.get_container_client(s.BLOB_CONTAINER)
+
+def _safe_int(val: Any, default: int) -> int:
+    try:
+        return int(val)
+    except Exception:
+        return default
+
+# Prevent Cosmos SQL injection via "field" param
+ALLOWED_FIELDS = {
+    "ClientID",
+    "PortEntry",
+    "SCAC",
+    "MastBillNum",
+    "ShipperRefNum",
+    "RelDate",
+    "EntryNum",
+    "ImpName",
+    "ContainerNum",
+    "StatementNum",
+    "ImporterID",
+    "ImporterNumber",
+}
+
+def _make_cosmos_where(field: str, contains: bool, pk: Optional[str]) -> tuple[str, list[dict[str, Any]]]:
     """
-    blob_path may be:
-      - "<container>/<blobName>"
-      - "<blobName>"
-      - full URL
-    Returns a SAS-less public URL (ONLY for display; not for access if container is private).
+    Returns (where_sql, params) for Cosmos SQL.
     """
-    if not blob_path:
-        return ""
-    bp = blob_path.strip()
+    params: list[dict[str, Any]] = []
+    clauses: list[str] = []
 
-    # If full URL, strip query/fragment and return
-    if bp.startswith("http://") or bp.startswith("https://"):
-        return _strip_sas(bp)
+    if pk:
+        clauses.append("c.pk = @pk")
+        params.append({"name": "@pk", "value": pk})
 
-    # If starts with container/
-    if bp.startswith(s.BLOB_CONTAINER + "/"):
-        return f"https://{s.BLOB_ACCOUNT}.blob.core.windows.net/{bp}"
+    # value always provided by caller
+    if contains:
+        clauses.append(f"CONTAINS(c.{field}, @value, true)")
+    else:
+        clauses.append(f"c.{field} = @value")
 
-    # Otherwise treat as blobName
-    return f"https://{s.BLOB_ACCOUNT}.blob.core.windows.net/{s.BLOB_CONTAINER}/{bp}"
+    return " AND ".join(clauses), params
 
-def _strip_sas(url: str) -> str:
-    """Remove any query/fragment from a blob URL (drop SAS)."""
-    if not url:
-        return url
-    parts = urlsplit(url)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
-def _normalize_blob_name(s: Settings, value: str) -> str:
+def _sas_url_for_blob(blob_name: str, filename: Optional[str] = None, hours: Optional[int] = None) -> str:
     """
-    Accepts:
-      - full URL: https://acct.blob.core.windows.net/container/blob?SAS
-      - blobPath: container/blob
-      - blobName: blob
-    Returns:
-      - blobName (no container prefix)
+    Generate a SAS URL for a blob in the configured container.
     """
-    v = (value or "").strip()
-    if not v:
-        return ""
-
-    # Full URL => extract path after .net/
-    if f"://{s.BLOB_ACCOUNT}.blob.core.windows.net/" in v:
-        try:
-            path = v.split(".net/", 1)[1].split("?", 1)[0]
-            if path.startswith(s.BLOB_CONTAINER + "/"):
-                return path[len(s.BLOB_CONTAINER) + 1 :]
-            # if it’s some other container, return everything after first slash
-            return path.split("/", 1)[1]
-        except Exception:
-            pass
-
-    # blobPath "container/blob"
-    prefix = s.BLOB_CONTAINER + "/"
-    if v.startswith(prefix):
-        return v[len(prefix):]
-
-    # blobName already
-    return v
-
-def _sanitize_doc_urls(s: Settings, doc: Dict[str, Any]) -> None:
-    """
-    Keep fileUrl SAS-free for DISPLAY only.
-    UI should use /items/<id>/download to actually open/download the file.
-    """
-    bp_ = doc.get("blobPath")
-    fu = doc.get("fileUrl")
-    if isinstance(fu, str) and fu:
-        doc["fileUrl"] = _strip_sas(fu)
-    elif bp_:
-        doc["fileUrl"] = _public_blob_url(s, bp_)
-
-def _pager_results(it, continuation: Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """
-    Cosmos v4.7: by_page(continuation_token=...) only.
-    Page size must be set via iterator creation (max_item_count).
-    """
-    page_iter = it.by_page(continuation_token=continuation or None)
-    first_page = next(page_iter, None)
-    items: List[Dict[str, Any]] = []
-    if first_page is not None:
-        for doc in first_page:
-            items.append(doc)
-    next_token = getattr(page_iter, "continuation_token", None)
-    return items, next_token
-
-def _sas_url_for_blob(s: Settings, blob_name: str, *, hours: int = 1, filename: Optional[str] = None) -> str:
-    """
-    Mint a fresh READ SAS URL for a blobName (no container prefix).
-    """
-    if not blob_name:
-        raise ValueError("blob_name is required")
-
-    # Use UTC times for SAS
-    start = datetime.datetime.utcnow() - datetime.timedelta(minutes=5)
-    expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=hours)
-
-    disp_name = filename or blob_name.split("/")[-1]
-    content_disposition = f'inline; filename="{disp_name}"'
+    s = _settings()
+    expiry_hours = int(hours or getattr(s, "SAS_HOURS", 1) or 1)
 
     sas = generate_blob_sas(
         account_name=s.BLOB_ACCOUNT,
@@ -142,181 +88,166 @@ def _sas_url_for_blob(s: Settings, blob_name: str, *, hours: int = 1, filename: 
         blob_name=blob_name,
         account_key=s.BLOB_KEY,
         permission=BlobSasPermissions(read=True),
-        start=start,
-        expiry=expiry,
-        content_disposition=content_disposition,
-        content_type="application/pdf",
+        expiry=datetime.utcnow() + timedelta(hours=expiry_hours),
     )
-    return f"https://{s.BLOB_ACCOUNT}.blob.core.windows.net/{s.BLOB_CONTAINER}/{blob_name}?{sas}"
 
-# -------- health --------
+    # Optional: content-disposition filename hint
+    cd = ""
+    if filename:
+        cd = f"&rscd=attachment%3B%20filename%3D{_urlencode_filename(filename)}"
+
+    return f"https://{s.BLOB_ACCOUNT}.blob.core.windows.net/{s.BLOB_CONTAINER}/{blob_name}?{sas}{cd}"
+
+def _urlencode_filename(name: str) -> str:
+    # minimal safe encoding for filename in query
+    return (
+        name.replace("%", "%25")
+        .replace(" ", "%20")
+        .replace('"', "%22")
+        .replace("#", "%23")
+        .replace("&", "%26")
+        .replace("+", "%2B")
+        .replace(";", "%3B")
+    )
+
+# ----------------------------
+# Routes
+# ----------------------------
+
 @bp.get("/health")
 def health():
     return jsonify({"ok": True})
 
-# -------- auth (placeholder) --------
-@bp.post("/auth/login")
-def login():
-    # your existing auth logic here
-    return jsonify({"ok": True})
 
-@bp.post("/auth/logout")
-def logout():
-    # your existing auth logic here
-    return jsonify({"ok": True})
-
-# -------- get item --------
-@bp.get("/items/<string:item_id>")
-def get_item(item_id: str):
-    pk = request.args.get("pk")
-    if not pk:
-        return jsonify({"error": "Missing query param 'pk'."}), 400
-    try:
-        doc = container().read_item(item=item_id, partition_key=pk)
-        _sanitize_doc_urls(settings(), doc)
-        return jsonify(doc)
-    except cos_ex.CosmosResourceNotFoundError:
-        return jsonify({"error": "Not found"}), 404
-
-# -------- download (FIXED) --------
-@bp.get("/items/<string:item_id>/download")
-def download_item_pdf(item_id: str):
-    """
-    Redirects to a freshly minted SAS URL for the item PDF.
-    The UI should link to THIS endpoint (see buildDownloadUrl in api.js).
-    """
-    pk = request.args.get("pk")
-    if not pk:
-        return jsonify({"error": "Missing query param 'pk'."}), 400
-
-    try:
-        doc = container().read_item(item=item_id, partition_key=pk)
-        s = settings()
-
-        blob_path = doc.get("blobPath")
-
-        # If no blobPath, derive it from fileUrl and persist it.
-        if not blob_path:
-            file_url = doc.get("fileUrl")
-            if not file_url:
-                return jsonify({"error": "No PDF attached"}), 404
-            try:
-                path = file_url.split(".net/", 1)[1].split("?", 1)[0]  # "container/blob" (or similar)
-                doc["blobPath"] = path
-                container().replace_item(doc, doc)
-                blob_path = path
-            except Exception:
-                return jsonify({"error": "No blobPath and could not parse fileUrl"}), 500
-
-        # Normalize to blobName (no container prefix)
-        blob_name = _normalize_blob_name(s, blob_path)
-
-        # Optional: if you have a display filename in doc
-        filename = doc.get("pdfFilename") or blob_name.split("/")[-1]
-
-        # Mint SAS and redirect
-        url = _sas_url_for_blob(s, blob_name, hours=24, filename=filename)
-        return redirect(url, code=302)
-
-    except cos_ex.CosmosResourceNotFoundError:
-        return jsonify({"error": "Not found"}), 404
-
-# -------- search (one field) --------
 @bp.get("/search/one")
+@require_login
 def search_one():
-    field = request.args.get("field")
-    value = request.args.get("value")
+    """
+    GET /search/one?field=SCAC&value=on&contains=true&page_size=50&continuation=...
+    Returns: {"items":[...], "continuation":"..."}
+    """
+    field = (request.args.get("field") or "").strip()
+    value = (request.args.get("value") or "").strip()
     pk = request.args.get("pk")
-    contains = request.args.get("contains", "false").lower() == "true"
-    page_size = int(request.args.get("page_size") or "50")
-    continuation = request.args.get("continuation")
+    contains = (request.args.get("contains") or "false").lower() == "true"
+    page_size = _safe_int(request.args.get("page_size"), 50)
+    continuation = request.args.get("continuation") or None
 
-    if not field or value is None:
+    if not field or not value:
         return jsonify({"error": "field and value are required"}), 400
 
-    # Build query (parameterized)
-    if contains:
-        where = f"CONTAINS(c.{field}, @value, true)"
-    else:
-        where = f"c.{field} = @value"
+    if field not in ALLOWED_FIELDS:
+        return jsonify({"error": f"invalid field: {field}"}), 400
 
-    if pk:
-        where = f"{where} AND c.pk = @pk"
+    # For dates, your UI typically does exact match
+    if field == "RelDate":
+        contains = False
 
-    query = f"SELECT * FROM c WHERE {where}"
-    params = [{"name": "@value", "value": value}]
-    if pk:
-        params.append({"name": "@pk", "value": pk})
+    where_sql, params = _make_cosmos_where(field=field, contains=contains, pk=pk)
+    params = [{"name": "@value", "value": value}] + params
 
-    it = container().query_items(
-        query=query,
-        parameters=params,
-        enable_cross_partition_query=(pk is None),
-        max_item_count=page_size,
+    query = f"SELECT * FROM c WHERE {where_sql}"
+
+    container = _cosmos_container()
+
+    # IMPORTANT FIX (prevents your 500):
+    # In many azure-cosmos versions, max_item_count MUST be passed to query_items(),
+    # not to by_page().
+    pager = (
+        container.query_items(
+            query=query,
+            parameters=params,
+            enable_cross_partition_query=True,
+            max_item_count=page_size,  # <-- FIX
+        )
+        .by_page(continuation_token=continuation)  # <-- no max_item_count here
     )
-
-    docs, next_token = _pager_results(it, continuation)
-    s = settings()
-    for d in docs:
-        _sanitize_doc_urls(s, d)
-
-    return jsonify({"items": docs, "continuation": next_token})
-
-# -------- zip download (example) --------
-@bp.get("/items/zip")
-def zip_items():
-    """
-    Example: zip multiple PDFs by passing ids and pk.
-    """
-    # Your existing zip logic here if you have it
-    return jsonify({"error": "Not implemented"}), 501
-
-# -------- On-demand SAS for a single blob (kept) --------
-@bp.get("/blob/sas")
-def blob_sas():
-    """
-    Mint a fresh SAS for a given blob.
-    Query:
-      - path: required; may be blobName ('0196792-6/foo.pdf'), blobPath ('files/0196792-6/foo.pdf'), or full URL
-      - filename: optional; suggests Content-Disposition filename
-      - att: 1 to force attachment; otherwise inline
-      - hours: int override for expiry (default 1h)
-      - content_type: override content type (default application/octet-stream)
-    """
-    s = settings()
-    path = request.args.get("path")
-    if not path:
-        return jsonify({"error": "path is required"}), 400
-
-    filename = request.args.get("filename")
-    as_attachment = request.args.get("att", "0") == "1"
-    hours_raw = request.args.get("hours")
-    content_type = request.args.get("content_type") or "application/octet-stream"
 
     try:
-        hours = int(hours_raw) if hours_raw else 1
-    except Exception:
-        hours = 1
+        page = next(pager)
+    except StopIteration:
+        return jsonify({"items": [], "continuation": None}), 200
 
-    blob_name = _normalize_blob_name(s, path)
+    items = list(page)
+    next_token = getattr(pager, "continuation_token", None)
 
-    start = datetime.datetime.utcnow() - datetime.timedelta(minutes=5)
-    expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=hours)
+    return jsonify({"items": items, "continuation": next_token}), 200
 
-    sas = generate_blob_sas(
-        account_name=s.BLOB_ACCOUNT,
-        container_name=s.BLOB_CONTAINER,
-        blob_name=blob_name,
-        account_key=s.BLOB_KEY,
-        permission=BlobSasPermissions(read=True),
-        start=start,
-        expiry=expiry,
-        content_disposition=(
-            f'attachment; filename="{filename or blob_name.split("/")[-1]}"'
-            if as_attachment
-            else f'inline; filename="{filename or blob_name.split("/")[-1]}"'
-        ),
-        content_type=content_type,
+
+@bp.post("/download/batch")
+@require_login
+def download_batch():
+    """
+    POST /download/batch
+    Body: {"files":[{"blobName":"<path/in/container>", "filename":"optional.pdf"}, ...]}
+    Returns: zip file download
+    """
+    data = request.get_json(silent=True) or {}
+    files = data.get("files") or []
+
+    if not isinstance(files, list) or len(files) == 0:
+        return jsonify({"error": "files[] is required"}), 400
+
+    blob_container = _blob_container_client()
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+
+            blob_name = (f.get("blobName") or "").lstrip("/")
+            filename = (f.get("filename") or os.path.basename(blob_name) or "file")
+
+            if not blob_name:
+                continue
+
+            try:
+                data_bytes = blob_container.get_blob_client(blob_name).download_blob().readall()
+            except Exception as ex:
+                data_bytes = f"ERROR: could not download {blob_name}\n{ex}".encode("utf-8")
+
+            z.writestr(filename, data_bytes)
+
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"ryker-download-{int(datetime.utcnow().timestamp())}.zip",
     )
-    url = f"https://{s.BLOB_ACCOUNT}.blob.core.windows.net/{s.BLOB_CONTAINER}/{blob_name}?{sas}"
-    return jsonify({"url": url})
+
+
+@bp.get("/items/<item_id>/download")
+@require_login
+def download_single(item_id: str):
+    """
+    GET /items/<id>/download?blob=<blobName>&filename=<name>&hours=1
+    Returns a redirect-ish payload containing a SAS URL (client can window.open it).
+    NOTE: Your current UI usually uses f.url already, but this endpoint keeps buildDownloadUrl working.
+    """
+    blob_name = (request.args.get("blob") or "").lstrip("/")
+    filename = request.args.get("filename")
+    hours = request.args.get("hours")
+    hours_i = _safe_int(hours, 1) if hours is not None else None
+
+    if not blob_name:
+        # fallback: try to read the item and pick first file blobName/url if present
+        try:
+            container = _cosmos_container()
+            # If your container is partitioned by pk, you can pass pk via querystring in the future.
+            doc = container.read_item(item=item_id, partition_key=item_id)
+        except Exception:
+            doc = None
+
+        if doc and isinstance(doc, dict):
+            files = doc.get("files") or []
+            if files and isinstance(files, list) and isinstance(files[0], dict):
+                blob_name = (files[0].get("blobName") or files[0].get("blobPath") or "").lstrip("/")
+                filename = filename or files[0].get("name") or files[0].get("filename")
+
+    if not blob_name:
+        return jsonify({"error": "missing blob (provide ?blob=...)"}), 400
+
+    url = _sas_url_for_blob(blob_name=blob_name, filename=filename, hours=hours_i)
+    return jsonify({"ok": True, "url": url}), 200
